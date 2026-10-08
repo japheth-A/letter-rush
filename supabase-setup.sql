@@ -4,11 +4,27 @@ create table if not exists public.rooms (
   host_player_id uuid not null references auth.users(id) on delete cascade,
   status text not null default 'waiting' check (status in ('waiting', 'playing', 'finished')),
   round_number integer not null default 0 check (round_number >= 0),
+  categories text[] not null default array[
+    'A person''s name',
+    'An animal',
+    'Something to eat',
+    'A place',
+    'Something you can find at home'
+  ]::text[],
   letter text check (letter is null or letter ~ '^[A-W]$'),
   started_at timestamptz,
   finished_at timestamptz,
   created_at timestamptz not null default now()
 );
+
+alter table public.rooms
+  add column if not exists categories text[] not null default array[
+    'A person''s name',
+    'An animal',
+    'Something to eat',
+    'A place',
+    'Something you can find at home'
+  ]::text[];
 
 create table if not exists public.room_players (
   room_id uuid not null references public.rooms(id) on delete cascade,
@@ -16,11 +32,20 @@ create table if not exists public.room_players (
   player_name text not null check (char_length(player_name) between 1 and 24),
   is_host boolean not null default false,
   total_score integer not null default 0 check (total_score >= 0),
-  round_score integer not null default 0 check (round_score between 0 and 50),
+  round_score integer not null default 0,
+  answer_fingerprints jsonb,
   submitted_at timestamptz,
   joined_at timestamptz not null default now(),
   primary key (room_id, player_id)
 );
+
+alter table public.room_players
+  drop constraint if exists room_players_round_score_check;
+alter table public.room_players
+  add constraint room_players_round_score_check check (round_score between 0 and 110);
+
+alter table public.room_players
+  add column if not exists answer_fingerprints jsonb;
 
 create index if not exists room_players_room_joined_idx
   on public.room_players (room_id, joined_at);
@@ -171,9 +196,12 @@ begin
   if (select count(*) from public.room_players where room_id = v_room.id) < 2 then
     raise exception 'Invite at least one friend before starting.';
   end if;
+  if cardinality(v_room.categories) not between 1 and 11 then
+    raise exception 'Choose between 1 and 11 categories before starting.';
+  end if;
 
   update public.room_players
-  set round_score = 0, submitted_at = null
+  set round_score = 0, answer_fingerprints = null, submitted_at = null
   where room_id = v_room.id;
   update public.rooms
   set status = 'playing',
@@ -181,6 +209,64 @@ begin
       letter = substr('ABCDEFGHIJKLMNOPRSTUVW', floor(random() * 22)::integer + 1, 1),
       started_at = now(),
       finished_at = null
+  where id = v_room.id;
+end;
+$function$;
+
+create or replace function public.update_room_categories(p_room_code text, p_categories text[])
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $function$
+declare
+  v_player_id uuid := auth.uid();
+  v_room public.rooms%rowtype;
+  v_category text;
+  v_seen text[] := array[]::text[];
+  v_allowed_categories text[] := array[
+    'A person''s name',
+    'An animal',
+    'Something to eat',
+    'A place',
+    'Something you can find at home',
+    'A color',
+    'A job',
+    'A movie or book',
+    'Something in nature',
+    'A mode of transport',
+    'Something at school'
+  ]::text[];
+begin
+  select * into v_room
+  from public.rooms
+  where code = upper(trim(p_room_code))
+  for update;
+  if not found then
+    raise exception 'That room was not found.';
+  end if;
+  if v_player_id is null or v_room.host_player_id <> v_player_id then
+    raise exception 'Only the room host can change categories.';
+  end if;
+  if v_room.status not in ('waiting', 'finished') then
+    raise exception 'Categories cannot be changed during a round.';
+  end if;
+  if p_categories is null or cardinality(p_categories) not between 1 and cardinality(v_allowed_categories) then
+    raise exception 'Choose between 1 and 11 categories.';
+  end if;
+
+  foreach v_category in array p_categories loop
+    if v_category is null or not (v_category = any(v_allowed_categories)) then
+      raise exception 'That category is not available.';
+    end if;
+    if v_category = any(v_seen) then
+      raise exception 'A category cannot be selected more than once.';
+    end if;
+    v_seen := array_append(v_seen, v_category);
+  end loop;
+
+  update public.rooms
+  set categories = v_seen
   where id = v_room.id;
 end;
 $function$;
@@ -208,11 +294,16 @@ begin
   update public.rooms
   set status = 'finished', finished_at = now()
   where id = v_room.id;
+  update public.room_players
+  set answer_fingerprints = null
+  where room_id = v_room.id;
   return true;
 end;
 $function$;
 
-create or replace function public.submit_room_answers(p_room_code text, p_answers jsonb)
+drop function if exists public.submit_room_answers(text, jsonb);
+
+create or replace function public.submit_room_answers(p_room_code text, p_answers jsonb, p_fingerprints jsonb)
 returns integer
 language plpgsql
 security definer
@@ -221,9 +312,12 @@ as $function$
 declare
   v_player_id uuid := auth.uid();
   v_room public.rooms%rowtype;
+  v_scored_player public.room_players%rowtype;
   v_answer text;
+  v_fingerprint text;
   v_score integer := 0;
   v_index integer;
+  v_match_count integer;
 begin
   select * into v_room
   from public.rooms
@@ -238,8 +332,17 @@ begin
   ) then
     raise exception 'You are not a player in this room.';
   end if;
-  if jsonb_typeof(p_answers) <> 'array' or jsonb_array_length(p_answers) <> 5 then
+  if jsonb_typeof(p_answers) is distinct from 'array' then
     raise exception 'Please submit one answer for each category.';
+  end if;
+  if jsonb_array_length(p_answers) <> cardinality(v_room.categories) then
+    raise exception 'Please submit one answer for each category.';
+  end if;
+  if jsonb_typeof(p_fingerprints) is distinct from 'array' then
+    raise exception 'Answer matching data is missing. Reload the game and try again.';
+  end if;
+  if jsonb_array_length(p_fingerprints) <> cardinality(v_room.categories) then
+    raise exception 'Answer matching data is missing. Reload the game and try again.';
   end if;
 
   if public.finish_room_if_due(v_room.id) then
@@ -257,24 +360,57 @@ begin
     return v_score;
   end if;
 
-  for v_index in 0..4 loop
-    if jsonb_typeof(p_answers -> v_index) <> 'string' then
+  for v_index in 0..cardinality(v_room.categories) - 1 loop
+    if jsonb_typeof(p_answers -> v_index) is distinct from 'string' then
       raise exception 'Answers must be text.';
     end if;
+    if jsonb_typeof(p_fingerprints -> v_index) is distinct from 'string' then
+      raise exception 'Answer matching data must be text.';
+    end if;
     v_answer := trim(p_answers ->> v_index);
+    v_fingerprint := p_fingerprints ->> v_index;
     if char_length(v_answer) > 60 then
       raise exception 'Answers must be 60 characters or fewer.';
     end if;
     if v_answer <> '' and upper(left(v_answer, 1)) = v_room.letter then
-      v_score := v_score + 10;
+      if v_fingerprint is null or v_fingerprint !~ '^[a-f0-9]{64}$' then
+        raise exception 'A valid answer is missing its matching fingerprint.';
+      end if;
+    elsif v_fingerprint <> '' then
+      raise exception 'Invalid answers cannot have matching fingerprints.';
     end if;
   end loop;
 
   update public.room_players
-  set round_score = v_score,
-      total_score = total_score + v_score,
+  set answer_fingerprints = p_fingerprints,
       submitted_at = now()
   where room_id = v_room.id and player_id = v_player_id;
+
+  for v_scored_player in
+    select *
+    from public.room_players
+    where room_id = v_room.id
+      and submitted_at is not null
+      and answer_fingerprints is not null
+  loop
+    v_score := 0;
+    for v_index in 0..cardinality(v_room.categories) - 1 loop
+      v_fingerprint := v_scored_player.answer_fingerprints ->> v_index;
+      if v_fingerprint <> '' then
+        select count(*) into v_match_count
+        from public.room_players p
+        where p.room_id = v_room.id
+          and p.submitted_at is not null
+          and (p.answer_fingerprints ->> v_index) = v_fingerprint;
+        v_score := v_score + case when v_match_count >= 2 then 5 else 10 end;
+      end if;
+    end loop;
+
+    update public.room_players
+    set total_score = total_score - v_scored_player.round_score + v_score,
+        round_score = v_score
+    where room_id = v_room.id and player_id = v_scored_player.player_id;
+  end loop;
 
   if not exists (
     select 1 from public.room_players
@@ -283,7 +419,13 @@ begin
     update public.rooms
     set status = 'finished', finished_at = now()
     where id = v_room.id;
+    update public.room_players
+    set answer_fingerprints = null
+    where room_id = v_room.id;
   end if;
+  select round_score into v_score
+  from public.room_players
+  where room_id = v_room.id and player_id = v_player_id;
   return v_score;
 end;
 $function$;
@@ -361,14 +503,16 @@ $function$;
 revoke all on function public.create_room(text) from public, anon;
 revoke all on function public.join_room(text, text) from public, anon;
 revoke all on function public.start_room_round(text) from public, anon;
+revoke all on function public.update_room_categories(text, text[]) from public, anon;
 revoke all on function public.finish_room_if_due(uuid) from public, anon, authenticated;
-revoke all on function public.submit_room_answers(text, jsonb) from public, anon;
+revoke all on function public.submit_room_answers(text, jsonb, jsonb) from public, anon;
 revoke all on function public.finish_room_on_timeout(text) from public, anon;
 revoke all on function public.leave_room(text) from public, anon;
 grant execute on function public.create_room(text) to authenticated;
 grant execute on function public.join_room(text, text) to authenticated;
 grant execute on function public.start_room_round(text) to authenticated;
-grant execute on function public.submit_room_answers(text, jsonb) to authenticated;
+grant execute on function public.update_room_categories(text, text[]) to authenticated;
+grant execute on function public.submit_room_answers(text, jsonb, jsonb) to authenticated;
 grant execute on function public.finish_room_on_timeout(text) to authenticated;
 grant execute on function public.leave_room(text) to authenticated;
 

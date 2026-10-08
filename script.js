@@ -14,6 +14,7 @@ const CATEGORY_OPTIONS = [
   { name: "A mode of transport", icon: "➜", placeholder: "e.g. Scooter", dictionaryCheck: true },
   { name: "Something at school", icon: "⌑", placeholder: "e.g. Science", dictionaryCheck: true },
 ];
+const ROOM_CATEGORY_CATALOG = [...CATEGORIES, ...CATEGORY_OPTIONS];
 const ROUND_LENGTH = 60;
 const POINTS_PER_ANSWER = 10;
 const LETTERS = "ABCDEFGHIJKLMNOPRSTUVW".split("");
@@ -60,6 +61,7 @@ let countdownInProgress = false;
 const dictionaryCache = new Map();
 let supabaseClient = null;
 let activeRoom = null;
+let categoryUpdatePending = false;
 let roomChannel = null;
 let roomRefreshTimeout = null;
 let activeClockKey = "";
@@ -74,7 +76,7 @@ function createCategoryFields(selectedCategories = new Set(CATEGORIES.map((categ
           <input id="category-toggle-${index}" class="category-toggle" type="checkbox" ${selectedCategories.has(category.name) ? "checked" : ""} aria-label="Include ${category.name}">
           <span><span class="category-icon" aria-hidden="true">${category.icon}</span>${category.name}</span>
         </label>
-        ${index >= DEFAULT_CATEGORY_COUNT
+        ${activeRoom || index >= DEFAULT_CATEGORY_COUNT
           ? `<button class="remove-category-button" type="button" aria-label="Remove ${category.name} category" title="Remove category">×</button>`
           : `<span class="category-number">${String(index + 1).padStart(2, "0")}</span>`}
       </div>
@@ -84,7 +86,8 @@ function createCategoryFields(selectedCategories = new Set(CATEGORIES.map((categ
 }
 
 function renderCategoryOptions() {
-  const availableOptions = CATEGORY_OPTIONS.filter(
+  const options = activeRoom ? ROOM_CATEGORY_CATALOG : CATEGORY_OPTIONS;
+  const availableOptions = options.filter(
     (option) => !CATEGORIES.some((category) => category.name === option.name),
   );
   categoryOptions.innerHTML = availableOptions.map((option) => `
@@ -97,9 +100,14 @@ function renderCategoryOptions() {
 }
 
 function addCategory(categoryName) {
-  const category = CATEGORY_OPTIONS.find((option) => option.name === categoryName);
+  const options = activeRoom ? ROOM_CATEGORY_CATALOG : CATEGORY_OPTIONS;
+  const category = options.find((option) => option.name === categoryName);
   if (!category || CATEGORIES.some((existing) => existing.name === category.name)) return;
-  if (roundActive || countdownInProgress || activeRoom) return;
+  if (activeRoom) {
+    updateRoomCategories([...CATEGORIES.map((existing) => existing.name), category.name]);
+    return;
+  }
+  if (roundActive || countdownInProgress) return;
 
   CATEGORIES.push(category);
   const selectedCategories = new Set(selectedCategoryNames());
@@ -119,9 +127,15 @@ function selectedCategoryNames() {
 }
 
 function removeCategory(categoryIndex) {
-  if (categoryIndex < DEFAULT_CATEGORY_COUNT || roundActive || countdownInProgress || activeRoom) return;
   const category = CATEGORIES[categoryIndex];
   if (!category) return;
+
+  if (activeRoom) {
+    if (!canEditRoomCategories()) return;
+    updateRoomCategories(CATEGORIES.filter((_, index) => index !== categoryIndex).map((existing) => existing.name));
+    return;
+  }
+  if (categoryIndex < DEFAULT_CATEGORY_COUNT || roundActive || countdownInProgress) return;
 
   const selectedCategories = new Set(selectedCategoryNames());
   selectedCategories.delete(category.name);
@@ -133,24 +147,82 @@ function removeCategory(categoryIndex) {
 }
 
 function syncCategoryControls(answersDisabled, pickerDisabled) {
+  const canEditRoom = canEditRoomCategories();
   const roomIsPlaying = Boolean(activeRoom) && activeRoom.row?.status === "playing";
-  const selectionLocked = countdownInProgress || roundActive || (Boolean(activeRoom) && !roomIsPlaying);
+  const selectionLocked = countdownInProgress || roundActive;
   const answersLocked = Boolean(activeRoom) && !roomIsPlaying;
   categoriesGrid.querySelectorAll(".category-card").forEach((card) => {
     const toggle = card.querySelector(".category-toggle");
     const answer = card.querySelector('input[name^="answer-"]');
-    const categoryIndex = Number(card.dataset.categoryIndex);
-    const roomOnlyCategory = Boolean(activeRoom) && categoryIndex >= DEFAULT_CATEGORY_COUNT;
     const available = Boolean(activeRoom) || toggle.checked;
-    card.hidden = roomOnlyCategory;
+    const removeButton = card.querySelector(".remove-category-button");
+    card.hidden = false;
     card.classList.toggle("is-excluded", !available);
-    toggle.disabled = pickerDisabled || selectionLocked;
+    toggle.disabled = Boolean(activeRoom) || pickerDisabled || selectionLocked;
     answer.disabled = answersDisabled || !available || answersLocked;
+    if (removeButton) removeButton.disabled = activeRoom
+      ? !canEditRoom || CATEGORIES.length <= 1
+      : false;
   });
-  addCategoryButton.disabled = pickerDisabled || selectionLocked;
-  if (activeRoom) {
+  addCategoryButton.disabled = activeRoom ? !canEditRoom : pickerDisabled || selectionLocked;
+  addCategoryControls.hidden = categoryOptions.childElementCount === 0 || Boolean(activeRoom && !canEditRoom);
+  if (activeRoom && !canEditRoom) {
     categoryOptions.hidden = true;
     addCategoryButton.setAttribute("aria-expanded", "false");
+  }
+}
+
+function canEditRoomCategories() {
+  return Boolean(activeRoom)
+    && activeRoom.row?.host_player_id === activeRoom.playerId
+    && activeRoom.row.status !== "playing"
+    && !categoryUpdatePending;
+}
+
+function syncRoomCategories(categoryNames) {
+  const names = Array.isArray(categoryNames) && categoryNames.length
+    ? categoryNames
+    : ROOM_CATEGORY_CATALOG.slice(0, DEFAULT_CATEGORY_COUNT).map((category) => category.name);
+  const categories = names.map((name) => ROOM_CATEGORY_CATALOG.find((category) => category.name === name));
+  if (categories.some((category) => !category)) {
+    throw new Error("This room has an unknown category. Update the Supabase setup and reload.");
+  }
+  if (categories.map((category) => category.name).join("\0") === CATEGORIES.map((category) => category.name).join("\0")) return;
+
+  CATEGORIES.splice(0, CATEGORIES.length, ...categories);
+  createCategoryFields(new Set(names));
+  renderCategoryOptions();
+}
+
+async function updateRoomCategories(categoryNames) {
+  if (!activeRoom || !canEditRoomCategories()) return;
+  categoryUpdatePending = true;
+  submitButton.disabled = true;
+  submitLabel.textContent = "Updating categories…";
+  syncCategoryControls(true, true);
+  categoryOptions.hidden = true;
+  gameMessage.textContent = "Updating room categories…";
+  try {
+    const { error } = await supabaseClient.rpc("update_room_categories", {
+      p_room_code: activeRoom.code,
+      p_categories: categoryNames,
+    });
+    if (error) throw error;
+    await refreshRoom();
+    gameMessage.textContent = "Room categories updated for everyone.";
+  } catch (error) {
+    console.error("Could not update the room categories.", error);
+    gameMessage.textContent = error.message || "Could not update room categories. Try again.";
+  } finally {
+    categoryUpdatePending = false;
+    syncCategoryControls(true, true);
+    if (activeRoom?.row) {
+      const isHost = activeRoom.row.host_player_id === activeRoom.playerId;
+      submitButton.disabled = !isHost || activeRoom.players.length < 2;
+      submitLabel.textContent = isHost
+        ? activeRoom.row.round_number ? "Start next round" : "Start the match"
+        : "Waiting for host";
+    }
   }
 }
 
@@ -259,7 +331,7 @@ async function validateAnswers(answers, letter) {
     if (!answer.value.toLocaleLowerCase().startsWith(letter.toLocaleLowerCase())) {
       return { ...answer, isValid: false, invalidReason: "letter" };
     }
-    const category = [...CATEGORIES.slice(0, DEFAULT_CATEGORY_COUNT), ...CATEGORY_OPTIONS]
+    const category = ROOM_CATEGORY_CATALOG
       .find((option) => option.name === answer.category);
     if (category?.dictionaryCheck) {
       const words = answer.value.split(/\s+/)
@@ -271,6 +343,18 @@ async function validateAnswers(answers, letter) {
       }
     }
     return { ...answer, isValid: true, invalidReason: "" };
+  }));
+}
+
+async function createAnswerFingerprints(answers) {
+  if (!window.crypto?.subtle) {
+    throw new Error("Secure answer matching is unavailable. Open the game over HTTPS and try again.");
+  }
+  return Promise.all(answers.map(async (answer) => {
+    if (!answer.isValid) return "";
+    const normalizedAnswer = answer.value.normalize("NFKC").trim().replace(/\s+/gu, " ").toLocaleLowerCase("en-US");
+    const digest = await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(normalizedAnswer));
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   }));
 }
 
@@ -558,12 +642,17 @@ async function activateRoom(roomInfo) {
     await supabaseClient.removeChannel(roomChannel);
     roomChannel = null;
   }
+  const soloCategories = CATEGORIES.slice();
+  const soloSelectedCategories = new Set(selectedCategoryNames());
+  categoryUpdatePending = false;
   activeRoom = {
     id: roomInfo.room_id,
     code: roomInfo.room_code,
     playerId: roomInfo.player_id,
     row: null,
     players: [],
+    soloCategories,
+    soloSelectedCategories,
   };
   try {
     localStorage.setItem(ROOM_STORAGE_KEY, activeRoom.code);
@@ -632,14 +721,20 @@ async function refreshRoom() {
 function updateRoomView() {
   const room = activeRoom?.row;
   if (!room) return;
+  syncRoomCategories(room.categories);
   roomPanel.hidden = false;
   document.querySelector("#room-code").textContent = room.code;
   const playerCount = activeRoom.players.length;
+  const isHost = room.host_player_id === activeRoom.playerId;
   roomInstruction.textContent = room.status === "waiting"
-    ? `${playerCount} of ${ROOM_PLAYER_LIMIT} players · share the invite link.`
+    ? isHost
+      ? `${playerCount} of ${ROOM_PLAYER_LIMIT} players · add or remove categories before starting.`
+      : `${playerCount} of ${ROOM_PLAYER_LIMIT} players · the host chooses categories.`
     : room.status === "playing"
       ? "Live round · the timer is shared with everyone."
-      : "Round complete · the host can start another.";
+      : isHost
+        ? "Round complete · update categories before starting another."
+        : "Round complete · the host can update categories or start another.";
   renderPlayers();
   roundNumber = Math.max(1, room.round_number);
 
@@ -661,7 +756,6 @@ function updateRoomView() {
     roundStatus.innerHTML = `ROUND ${String(room.round_number).padStart(2, "0")} <span class="status-divider">/</span> WAITING`;
     remainingSeconds = ROUND_LENGTH;
     updateTimer();
-    const isHost = room.host_player_id === activeRoom.playerId;
     submitLabel.textContent = isHost ? (room.round_number ? "Start next round" : "Start the match") : "Waiting for host";
     submitButton.disabled = !isHost || playerCount < 2;
     syncCategoryControls(true, true);
@@ -673,11 +767,15 @@ function updateRoomView() {
 
   roundIndicator.className = "round-indicator complete";
   roundStatus.innerHTML = `ROUND ${String(room.round_number).padStart(2, "0")} <span class="status-divider">/</span> COMPLETE`;
-  const isHost = room.host_player_id === activeRoom.playerId;
   submitLabel.textContent = isHost ? "Start next round" : "Waiting for host";
   submitButton.disabled = !isHost || playerCount < 2;
   syncCategoryControls(true, true);
-  gameMessage.textContent = isHost ? "Start another round whenever your friends are ready." : "The host can start another round when everyone's ready.";
+  const endedAfterSubmissions = room.finished_at
+    && room.started_at
+    && new Date(room.finished_at).getTime() < new Date(room.started_at).getTime() + ROUND_LENGTH * 1000;
+  gameMessage.textContent = endedAfterSubmissions
+    ? isHost ? "Everyone submitted — the round ended early. Start another when you're ready." : "Everyone submitted — the round ended early. The host can start another."
+    : isHost ? "Time's up. Start another round whenever your friends are ready." : "Time's up. The host can start another round when everyone's ready.";
   showSharedResults(room);
 }
 
@@ -691,10 +789,12 @@ function renderPlayers() {
     name.textContent = player.player_name + (player.player_id === activeRoom.playerId ? " (you)" : "");
     const detail = document.createElement("span");
     detail.className = "player-detail";
-    detail.textContent = player.is_host
-      ? "HOST"
-      : activeRoom.row?.status === "playing"
-        ? player.submitted_at ? "READY" : "PLAYING"
+    detail.textContent = activeRoom.row?.status === "playing"
+      ? player.submitted_at
+        ? `+${player.round_score} PTS`
+        : player.is_host ? "HOST · PLAYING" : "PLAYING"
+      : player.is_host
+        ? "HOST"
         : `${player.total_score} PTS`;
     item.append(name, detail);
     playerList.append(item);
@@ -722,7 +822,7 @@ function enterSharedRound(room) {
   submitLabel.textContent = hasSubmitted ? "Answers submitted" : "Submit answers";
   submitButton.disabled = hasSubmitted;
   gameMessage.textContent = hasSubmitted
-    ? "Answers in! Your score will appear when everyone has finished."
+    ? `Answers in! You earned ${thisPlayer.round_score} points this round. Waiting for everyone to finish.`
     : `Your letter is ${room.letter}. Answers are checked when you submit.`;
 
   const deadline = new Date(room.started_at).getTime() + ROUND_LENGTH * 1000;
@@ -739,7 +839,7 @@ function enterSharedRound(room) {
 }
 
 async function startSharedRound() {
-  if (!activeRoom || !activeRoom.row || activeRoom.row.host_player_id !== activeRoom.playerId) return;
+  if (!activeRoom || !activeRoom.row || activeRoom.row.host_player_id !== activeRoom.playerId || categoryUpdatePending) return;
   submitButton.disabled = true;
   submitLabel.textContent = "Starting…";
   try {
@@ -759,9 +859,11 @@ async function submitSharedAnswers() {
   submitLabel.textContent = "Checking answers…";
   try {
     const answers = await validateAnswers(createCategoryInputs(), activeRoom.row.letter);
+    const answerFingerprints = await createAnswerFingerprints(answers);
     const { error } = await supabaseClient.rpc("submit_room_answers", {
       p_room_code: activeRoom.code,
       p_answers: answers.map((answer) => answer.isValid ? answer.value : ""),
+      p_fingerprints: answerFingerprints,
     });
     if (error) throw error;
     await refreshRoom();
@@ -776,6 +878,7 @@ async function submitSharedAnswers() {
 async function finishSharedRoundOnTimeout() {
   if (!activeRoom || activeRoom.row?.status !== "playing") return;
   timeoutRequestPending = true;
+  showSharedResults(activeRoom.row, true);
   gameMessage.textContent = "Time's up! Finishing the round…";
   try {
     const { data, error } = await supabaseClient.rpc("finish_room_on_timeout", {
@@ -791,15 +894,16 @@ async function finishSharedRoundOnTimeout() {
   }
 }
 
-function showSharedResults(room) {
+function showSharedResults(room, provisional = false) {
   const resultKey = `${room.id}:${room.round_number}`;
-  if (resultShownRound === resultKey) return;
-  resultShownRound = resultKey;
+  if (!provisional && resultShownRound === resultKey) return;
+  if (!provisional) resultShownRound = resultKey;
   const thisPlayer = activeRoom.players.find((player) => player.player_id === activeRoom.playerId);
   const score = thisPlayer?.round_score || 0;
   document.querySelector("#final-score").textContent = String(score);
-  document.querySelector("#result-kicker").textContent = "SHARED ROOM · ROUND COMPLETE";
-  document.querySelector("#result-title").textContent = score === 50 ? "Perfect round!" : score >= 30 ? "Nice thinking." : score > 0 ? "Good word work." : "There's always next round.";
+  document.querySelector("#result-kicker").textContent = provisional ? "TIME'S UP · SHARED ROOM" : "SHARED ROOM · ROUND COMPLETE";
+  const perfectScore = (room.categories?.length || DEFAULT_CATEGORY_COUNT) * POINTS_PER_ANSWER;
+  document.querySelector("#result-title").textContent = score === perfectScore ? "Perfect round!" : score >= 30 ? "Nice thinking." : score > 0 ? "Good word work." : "There's always next round.";
   document.querySelector("#result-copy").textContent = `Your ${room.letter} answers earned ${score} points. Here are the room scores.`;
   resultAnswers.innerHTML = [...activeRoom.players]
     .sort((first, second) => second.total_score - first.total_score)
@@ -849,15 +953,24 @@ async function leaveRoom() {
 }
 
 function clearActiveRoom() {
+  const soloCategories = activeRoom?.soloCategories;
+  const soloSelectedCategories = activeRoom?.soloSelectedCategories;
   if (roomChannel && supabaseClient) supabaseClient.removeChannel(roomChannel);
   roomChannel = null;
   activeRoom = null;
+  categoryUpdatePending = false;
+  if (soloCategories) {
+    CATEGORIES.splice(0, CATEGORIES.length, ...soloCategories);
+    createCategoryFields(soloSelectedCategories);
+    renderCategoryOptions();
+  }
   roomPanel.hidden = true;
   roundActive = false;
   activeClockKey = "";
   timeoutRequestPending = false;
   window.clearInterval(roundTimer);
   roundTimer = null;
+  syncCategoryControls(true, false);
   try {
     localStorage.removeItem(ROOM_STORAGE_KEY);
   } catch (error) {
