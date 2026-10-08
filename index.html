@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#f4f2ec">
+    <title>Letter Rush — The quick-thinking word game</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="supabase-config.js"></script>
+    <script src="script.js" defer></script>
+  </head>
+  <body>
+    <main class="game-shell">
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="Letter Rush home">
+          <span class="brand-mark" aria-hidden="true">L<span>R</span></span>
+          <span class="brand-name">letter<span>rush</span></span>
+        </a>
+        <button class="online-button" id="open-room-button" type="button"><span class="live-dot"></span> PLAY WITH FRIENDS <span aria-hidden="true">↗</span></button>
+        <div class="best-score">
+          <span class="best-icon" aria-hidden="true">✳</span>
+          <span>PERSONAL BEST</span>
+          <strong id="best-score">0</strong>
+        </div>
+      </header>
+
+      <section class="game-layout" aria-labelledby="game-title">
+        <div class="game-main">
+          <div class="eyebrow"><span class="eyebrow-line"></span> THE QUICK-THINKING WORD GAME</div>
+          <div class="heading-row">
+            <div>
+              <h1 id="game-title">Ready, set,<br><span>word.</span></h1>
+              <p class="intro">Pick your categories, reveal a letter, and see how many answers you can find before time runs out.</p>
+            </div>
+            <div class="letter-display" id="letter-display" aria-label="Your letter" aria-live="polite">
+              <span class="letter-hint">YOUR LETTER</span>
+              <span class="letter-value" id="letter-value">?</span>
+              <span class="letter-spark" aria-hidden="true">✳</span>
+            </div>
+          </div>
+
+          <div class="round-bar">
+            <div class="round-label">
+              <span class="round-indicator" id="round-indicator"></span>
+              <span id="round-status">ROUND 01 <span class="status-divider">/</span> GET READY</span>
+            </div>
+            <div class="timer" id="timer" role="timer" aria-label="60 seconds remaining">
+              <svg class="timer-ring" viewBox="0 0 40 40" aria-hidden="true">
+                <circle class="timer-track" cx="20" cy="20" r="17"></circle>
+                <circle class="timer-progress" id="timer-progress" cx="20" cy="20" r="17"></circle>
+              </svg>
+              <span id="timer-value">60</span>
+              <span class="timer-unit">SEC</span>
+            </div>
+          </div>
+
+          <form id="answer-form" novalidate>
+            <div class="categories-grid" id="categories-grid"></div>
+            <div class="add-category-controls" id="add-category-controls">
+              <button class="add-category-button" id="add-category-button" type="button" aria-expanded="false" aria-controls="category-options">
+                <span aria-hidden="true">+</span> Add category
+              </button>
+              <div class="category-options" id="category-options" aria-label="Category options" hidden></div>
+            </div>
+            <div class="form-footer">
+              <p class="keyboard-hint"><kbd>↵</kbd> enter your answers, then submit</p>
+              <button class="submit-button" id="submit-button" type="submit">
+                <span id="submit-label">Start the round</span>
+                <span class="button-arrow" aria-hidden="true">↗</span>
+              </button>
+            </div>
+          </form>
+          <p class="game-message" id="game-message" aria-live="polite">Ready when you are. Choose your categories, then watch the countdown.</p>
+        </div>
+
+        <aside class="side-panel">
+          <section class="room-panel" id="room-panel" hidden aria-live="polite">
+            <div class="room-panel-heading">
+              <span class="side-kicker">YOUR PRIVATE ROOM</span>
+              <button class="room-close-button" id="close-room-button" type="button" aria-label="Leave room">×</button>
+            </div>
+            <div class="room-code-row">
+              <span class="room-code" id="room-code">--------</span>
+              <button class="copy-room-button" id="copy-room-button" type="button">COPY INVITE</button>
+            </div>
+            <p class="room-instruction" id="room-instruction">Share the invite link with your friends.</p>
+            <ul class="player-list" id="player-list" aria-label="Players in your room"></ul>
+          </section>
+          <div class="side-top">
+            <span class="side-kicker">HOW TO PLAY</span>
+            <span class="side-spark" aria-hidden="true">✳</span>
+          </div>
+          <h2>Think of a word.<br>Beat the clock.</h2>
+          <ol class="how-to-list">
+            <li><span class="step-number">01</span><span>Choose the categories you want to play.</span></li>
+            <li><span class="step-number">02</span><span>Watch the countdown reveal your letter, then think of a matching word.</span></li>
+            <li><span class="step-number">03</span><span>Submit before time's up. Dictionary words are checked automatically.</span></li>
+          </ol>
+          <div class="side-divider"></div>
+          <div class="scoring-heading"><span>THE SCORING</span><span class="scoring-star">✳</span></div>
+          <div class="scoring-row"><span>Valid answer</span><strong>+10 <small>PTS</small></strong></div>
+          <div class="scoring-row"><span>Empty or wrong letter</span><strong class="zero-score">+0 <small>PTS</small></strong></div>
+          <div class="scoring-row"><span>Not in dictionary</span><strong class="zero-score">+0 <small>PTS</small></strong></div>
+          <p class="dictionary-note">Dictionary checks confirm spelling, not category fit. Names, places, and titles use first-letter scoring.</p>
+          <div class="side-footer">
+            <span class="footer-dot"></span>
+            <span>Your categories. One minute.<br><strong>You've got this.</strong></span>
+          </div>
+          <span class="side-decoration" aria-hidden="true">W</span>
+        </aside>
+      </section>
+
+      <footer class="page-footer">
+        <span>LETTER RUSH <span class="footer-separator">✳</span> THINK FAST, HAVE FUN</span>
+        <span>NO WRONG ANSWERS. WELL, ALMOST.</span>
+      </footer>
+    </main>
+
+    <div class="result-overlay" id="result-overlay" hidden>
+      <section class="result-card" role="dialog" aria-modal="true" aria-labelledby="result-title">
+        <div class="result-confetti" aria-hidden="true">✳</div>
+        <p class="result-kicker" id="result-kicker">ROUND COMPLETE</p>
+        <h2 id="result-title">Nice thinking.</h2>
+        <p class="result-copy" id="result-copy">Here's how you did this round.</p>
+        <div class="result-score"><span id="final-score">0</span><small>POINTS</small></div>
+        <div class="result-answers" id="result-answers"></div>
+        <button class="submit-button play-again-button" id="play-again-button" type="button">
+          <span>Play another round</span><span class="button-arrow" aria-hidden="true">↗</span>
+        </button>
+      </section>
+    </div>
+
+    <div class="result-overlay room-overlay" id="room-overlay" hidden>
+      <section class="result-card room-dialog" role="dialog" aria-modal="true" aria-labelledby="room-dialog-title">
+        <button class="dialog-close-button" id="close-room-dialog-button" type="button" aria-label="Close dialog">×</button>
+        <p class="result-kicker">LETTER RUSH · MULTIPLAYER</p>
+        <h2 id="room-dialog-title">Play together.</h2>
+        <p class="result-copy">Create a private room or join a friend. No account needed.</p>
+        <label class="dialog-label" for="player-name">DISPLAY NAME</label>
+        <input class="room-input" id="player-name" type="text" maxlength="24" autocomplete="nickname" placeholder="What should we call you?">
+        <label class="dialog-label" for="room-code-input">ROOM CODE <span>LEAVE BLANK TO CREATE A ROOM</span></label>
+        <input class="room-input room-code-input" id="room-code-input" type="text" maxlength="8" autocomplete="off" placeholder="e.g. 4F8A21BC">
+        <p class="room-dialog-message" id="room-dialog-message" aria-live="polite"></p>
+        <button class="submit-button room-action-button" id="create-room-button" type="button"><span>Create a room</span><span class="button-arrow" aria-hidden="true">↗</span></button>
+        <button class="join-room-button" id="join-room-button" type="button">Join with room code</button>
+        <p class="online-setup-note" id="online-setup-note" hidden>Online play needs a free Supabase project first. <a href="README.md" target="_blank" rel="noreferrer">Follow the setup guide</a>.</p>
+      </section>
+    </div>
+  </body>
+</html>
